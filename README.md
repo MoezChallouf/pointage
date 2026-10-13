@@ -68,56 +68,49 @@ L'application est pré-initialisée avec 5 collaborateurs tunisiens :
 ## 3. Architecture Technique
 
 - **Frontend** : React 19 + TypeScript + Tailwind CSS (palette neutre épurée, conformité typographique et zéro pill décorative).
-- **Backend** : Node.js (v22) + Express full-stack via `server.ts` avec API REST sécurisée sous `/api/*`.
-- **Moteur de base de données** :
-  1. **Exécution locale autonome** : SQLite (`node:sqlite` natif Node 22) dans `data/attendance.db` avec mode WAL, intégrité référentielle et contrainte d'unicité sur shift ouvert (`WHERE clock_out_at IS NULL`).
-  2. **Schéma Supabase / PostgreSQL** : Script complet de migration dans `supabase/migrations/20261013000000_init_hr_attendance.sql` incluant les politiques de sécurité Row Level Security (RLS).
+- **Backend** : Node.js + Express exposant l'API REST sécurisée sous `/api/*`.
+  - En local : `server.ts` (serveur Express + Vite).
+  - En production (Vercel) : `api/index.ts` (fonction serverless) + `vercel.json`.
+- **Base de données** : **Supabase / PostgreSQL** (driver `postgres.js`), chaîne de connexion via `SUPABASE_DB_URL`. Le schéma est provisionné automatiquement au premier démarrage et versionné dans `supabase/migrations/20261013000000_init_hr_attendance.sql`.
+- **Authentification** : sessions administrateur **JWT stateless** (HS256) signées avec `JWT_SECRET`, compatibles avec un déploiement serverless multi-instances.
 
 ---
 
 ## 4. Lancement & Tests
 
 ### Prérequis
-- **Node.js 22.16+** (requis pour le module natif `node:sqlite`). Aucune installation de PHP, MySQL ou XAMPP n'est nécessaire : le serveur Node embarque sa propre base SQLite.
+- **Node.js 20+**
+- Un projet **Supabase** (base PostgreSQL hébergée).
 
-### Installation
+### Configuration (`.env`)
+Copiez `.env.example` vers `.env` et renseignez :
+```
+SUPABASE_DB_URL="postgresql://postgres.[REF]:[PASSWORD]@aws-0-[REGION].pooler.supabase.com:6543/postgres"
+JWT_SECRET="une-chaine-aleatoire-longue-et-secrete"
+PORT=3000
+```
+> Dans Supabase : **Project Settings → Database → Connection string → Connection pooling → Transaction** (port 6543). Le schéma et les données de démonstration sont créés automatiquement au premier démarrage.
+
+### Installation & développement
 ```bash
 npm install
-```
-
-### Démarrage en développement
-```bash
 npm run dev
 ```
 L'application démarre sur le port 3000 (`http://localhost:3000`), avec rechargement à chaud Vite.
 
-### Exécution de la suite de tests automatisés
+### Tests & vérification du typage
 ```bash
-npm test
+npm test     # tests unitaires; tests PostgreSQL exécutés si SUPABASE_DB_URL est défini
+npm run lint # typage TypeScript
 ```
-Exécute les 15 tests unitaires et d'intégration validant le calcul des durées, le passage de minuit, la détection des retards, l'unicité des shifts, la validation des PINs et le journal d'audit.
 
-`npm run lint` vérifie le typage TypeScript.
-
-### Compilation & exécution en production
-```bash
-npm run build   # compile le frontend -> dist/ et le serveur -> server.js
-npm start       # lance le serveur en mode production (NODE_ENV=production)
-```
-- `npm run build` génère les fichiers statiques dans `dist/` puis regroupe le backend TypeScript dans un unique `server.js` via esbuild.
-- `npm start` démarre le serveur qui sert à la fois l'API `/api/*` et l'interface React compilée, sur le port défini dans `.env` (`PORT`, défaut 3000).
-- En production, l'application écoute sur `0.0.0.0` : elle est donc joignable depuis les autres postes du réseau local via `http://IP-DU-SERVEUR:3000`.
-
-### Configuration (`.env`)
-Copiez `.env.example` vers `.env` et adaptez si besoin :
-```
-PORT=3000
-APP_TIMEZONE="Africa/Tunis"
-APP_URL="http://localhost:3000"
-```
+### Déploiement sur Vercel (production)
+1. Importez le dépôt GitHub dans Vercel (**Add New → Project**).
+2. Dans **Settings → Environment Variables**, ajoutez `SUPABASE_DB_URL` et `JWT_SECRET`.
+3. Déployez : Vercel compile le frontend (`vite build` → `dist/`) et déploie l'API Express comme fonction serverless (`api/index.ts`).
+4. Ajoutez ensuite votre domaine personnalisé : **Settings → Domains → Add** (aucune modification de code nécessaire).
 
 ### Persistance des données
-Toutes les données (employés, pointages, anomalies, journal d'audit, paramètres) sont enregistrées automatiquement dans la base SQLite **`data/attendance.db`** (mode WAL). Aucune configuration supplémentaire n'est requise : les pointages survivent aux redémarrages du serveur.
-
-- **Sauvegarde** : copiez les fichiers `data/attendance.db`, `data/attendance.db-wal` et `data/attendance.db-shm` (ou arrêtez le serveur puis copiez `data/`).
-- **Remise à zéro** : supprimez le dossier `data/` puis relancez le serveur : les 5 collaborateurs et l'administrateur de démonstration seront recréés.
+Toutes les données (employés, pointages, anomalies, journal d'audit, paramètres) sont stockées dans **PostgreSQL Supabase** : elles persistent indépendamment du serveur et des redéploiements.
+- **Sauvegarde** : Supabase effectue des sauvegardes automatiques ; un export SQL manuel est possible depuis le tableau de bord.
+- **Remise à zéro** : videz les tables dans l'éditeur SQL Supabase ; les données de démonstration seront recréées au prochain démarrage si les tables sont vides.

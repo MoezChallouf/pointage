@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
-import crypto from 'crypto';
 import { db } from './db.js';
+import { signToken, verifyToken } from './auth.js';
 import {
   checkPinRateLimit,
   recordPinFailure,
@@ -18,14 +18,7 @@ import {
 
 export const apiRouter = Router();
 
-// In-memory admin session storage (tokens valid for 24h)
-const adminSessions = new Map<string, { adminId: string; email: string; name: string; expiresAt: number }>();
-
-function generateToken(): string {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-// Authentication middleware for administrative endpoints
+// Authentication middleware for administrative endpoints (stateless JWT)
 function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -33,10 +26,9 @@ function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
   }
 
   const token = authHeader.split(' ')[1];
-  const session = adminSessions.get(token);
+  const session = verifyToken(token);
 
-  if (!session || session.expiresAt < Date.now()) {
-    if (session) adminSessions.delete(token);
+  if (!session) {
     return res.status(401).json({ error: 'Session expirée ou invalide. Veuillez vous reconnecter.' });
   }
 
@@ -62,7 +54,6 @@ apiRouter.get('/kiosk/time', (req, res) => {
     year: 'numeric',
   });
   const dateFormatted = formatter.format(now);
-  // Capitalize first letter of day
   const dateCapitalized = dateFormatted.charAt(0).toUpperCase() + dateFormatted.slice(1);
 
   res.json({
@@ -75,7 +66,7 @@ apiRouter.get('/kiosk/time', (req, res) => {
 });
 
 // Helper to authenticate employee by PIN with rate limiting
-function verifyEmployeePin(pin: string, clientIp: string) {
+async function verifyEmployeePin(pin: string, clientIp: string): Promise<{ error: string; status: number } | { employee: any }> {
   const rateLimit = checkPinRateLimit(clientIp);
   if (!rateLimit.allowed) {
     return {
@@ -88,8 +79,8 @@ function verifyEmployeePin(pin: string, clientIp: string) {
     return { error: 'Le code PIN doit comporter exactement 4 chiffres.', status: 400 };
   }
 
-  // Fetch all active employees to verify PIN in constant-ish time without leaking which PIN belongs to whom
-  const employees = db.prepare('SELECT * FROM employees WHERE is_active = 1').all() as any[];
+  // Fetch all active employees to verify PIN without leaking which PIN belongs to whom
+  const employees = (await db.prepare('SELECT * FROM employees WHERE is_active = 1').all()) as any[];
 
   let matchedEmployee: any = null;
   for (const emp of employees) {
@@ -115,21 +106,21 @@ function verifyEmployeePin(pin: string, clientIp: string) {
 }
 
 // Check PIN & active shift status without performing an action
-apiRouter.post('/kiosk/status', (req, res) => {
+apiRouter.post('/kiosk/status', async (req, res) => {
   const { pin } = req.body;
   const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
 
-  const verification = verifyEmployeePin(pin, clientIp);
+  const verification = await verifyEmployeePin(pin, clientIp);
   if ('error' in verification) {
-    return res.status(verification.status!).json({ error: verification.error });
+    return res.status(verification.status).json({ error: verification.error });
   }
 
   const employee = verification.employee;
-  const openShift = db.prepare(`
+  const openShift = await db.prepare(`
     SELECT * FROM attendance_records 
     WHERE employee_id = ? AND clock_out_at IS NULL
     ORDER BY created_at DESC LIMIT 1
-  `).get(employee.id) as any;
+  `).get(employee.id);
 
   res.json({
     employeeName: employee.first_name,
@@ -141,13 +132,13 @@ apiRouter.post('/kiosk/status', (req, res) => {
 });
 
 // START SHIFT (Clock-in)
-apiRouter.post('/kiosk/clock-in', (req, res) => {
+apiRouter.post('/kiosk/clock-in', async (req, res) => {
   const { pin } = req.body;
   const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
 
-  const verification = verifyEmployeePin(pin, clientIp);
+  const verification = await verifyEmployeePin(pin, clientIp);
   if ('error' in verification) {
-    return res.status(verification.status!).json({ error: verification.error });
+    return res.status(verification.status).json({ error: verification.error });
   }
 
   const employee = verification.employee;
@@ -157,10 +148,10 @@ apiRouter.post('/kiosk/clock-in', (req, res) => {
   const tunisTime = getTunisCurrentTimeString(now).substring(0, 5); // HH:MM
 
   // Check if an open shift already exists
-  const openShift = db.prepare(`
+  const openShift = await db.prepare(`
     SELECT * FROM attendance_records 
     WHERE employee_id = ? AND clock_out_at IS NULL
-  `).get(employee.id) as any;
+  `).get(employee.id);
 
   if (openShift) {
     const shiftTime = new Intl.DateTimeFormat('fr-FR', {
@@ -177,20 +168,19 @@ apiRouter.post('/kiosk/clock-in', (req, res) => {
 
   // Create new attendance record
   const recordId = `att-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-  const settings = getCompanySettings();
+  const settings = await getCompanySettings();
 
   // Check late arrival
   const lateCheck = checkLateArrival(nowIso, settings);
   const initialStatus = lateCheck.isLate ? 'ANOMALY' : 'IN_PROGRESS';
 
-  db.exec('BEGIN TRANSACTION;');
   try {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO attendance_records (id, employee_id, date, clock_in_at, clock_out_at, status)
       VALUES (?, ?, ?, ?, NULL, ?)
     `).run(recordId, employee.id, tunisDate, nowIso, initialStatus);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO attendance_events (id, employee_id, attendance_record_id, event_type, event_at, created_by)
       VALUES (?, ?, ?, 'CLOCK_IN', ?, 'KIOSK')
     `).run(`evt-${Date.now()}-in`, employee.id, recordId, nowIso);
@@ -198,7 +188,7 @@ apiRouter.post('/kiosk/clock-in', (req, res) => {
     // If late, insert anomaly record
     if (lateCheck.isLate) {
       const anomId = `anom-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO anomalies (id, employee_id, attendance_record_id, anomaly_type, severity, description, status, detected_at)
         VALUES (?, ?, ?, 'LATE_ARRIVAL', 'LOW', ?, 'OPEN', datetime('now'))
       `).run(
@@ -208,10 +198,7 @@ apiRouter.post('/kiosk/clock-in', (req, res) => {
         `Arrivée tardive à ${tunisTime} (${lateCheck.minutesLate} minutes de retard par rapport à l'horaire prévu ${settings.expected_start_time})`
       );
     }
-
-    db.exec('COMMIT;');
   } catch (err: any) {
-    db.exec('ROLLBACK;');
     return res.status(500).json({ error: 'Erreur lors de l\'enregistrement du pointage. Veuillez réessayer.' });
   }
 
@@ -229,13 +216,13 @@ apiRouter.post('/kiosk/clock-in', (req, res) => {
 });
 
 // END SHIFT (Clock-out)
-apiRouter.post('/kiosk/clock-out', (req, res) => {
+apiRouter.post('/kiosk/clock-out', async (req, res) => {
   const { pin } = req.body;
   const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
 
-  const verification = verifyEmployeePin(pin, clientIp);
+  const verification = await verifyEmployeePin(pin, clientIp);
   if ('error' in verification) {
-    return res.status(verification.status!).json({ error: verification.error });
+    return res.status(verification.status).json({ error: verification.error });
   }
 
   const employee = verification.employee;
@@ -244,10 +231,10 @@ apiRouter.post('/kiosk/clock-out', (req, res) => {
   const tunisTime = getTunisCurrentTimeString(now).substring(0, 5); // HH:MM
 
   // Check for open shift
-  const openShift = db.prepare(`
+  const openShift = await db.prepare(`
     SELECT * FROM attendance_records 
     WHERE employee_id = ? AND clock_out_at IS NULL
-  `).get(employee.id) as any;
+  `).get(employee.id);
 
   if (!openShift) {
     return res.status(400).json({
@@ -265,26 +252,25 @@ apiRouter.post('/kiosk/clock-out', (req, res) => {
     minute: '2-digit',
   }).format(new Date(openShift.clock_in_at));
 
-  const settings = getCompanySettings();
+  const settings = await getCompanySettings();
   const earlyCheck = checkEarlyDeparture(nowIso, settings);
   const newStatus = openShift.status === 'ANOMALY' || earlyCheck.isEarly ? 'ANOMALY' : 'COMPLETED';
 
-  db.exec('BEGIN TRANSACTION;');
   try {
-    db.prepare(`
+    await db.prepare(`
       UPDATE attendance_records 
       SET clock_out_at = ?, status = ?, updated_at = datetime('now')
       WHERE id = ?
     `).run(nowIso, newStatus, openShift.id);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO attendance_events (id, employee_id, attendance_record_id, event_type, event_at, created_by)
       VALUES (?, ?, ?, 'CLOCK_OUT', ?, 'KIOSK')
     `).run(`evt-${Date.now()}-out`, employee.id, openShift.id, nowIso);
 
     if (earlyCheck.isEarly) {
       const anomId = `anom-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO anomalies (id, employee_id, attendance_record_id, anomaly_type, severity, description, status, detected_at)
         VALUES (?, ?, ?, 'EARLY_DEPARTURE', 'LOW', ?, 'OPEN', datetime('now'))
       `).run(
@@ -294,10 +280,7 @@ apiRouter.post('/kiosk/clock-out', (req, res) => {
         `Départ anticipé à ${tunisTime} (${earlyCheck.minutesEarly} min avant la fin prévue ${settings.expected_end_time})`
       );
     }
-
-    db.exec('COMMIT;');
   } catch (err: any) {
-    db.exec('ROLLBACK;');
     return res.status(500).json({ error: 'Erreur lors de l\'enregistrement de la fin de service.' });
   }
 
@@ -318,28 +301,20 @@ apiRouter.post('/kiosk/clock-out', (req, res) => {
 // 2. ADMIN AUTHENTICATION
 // ==========================================
 
-apiRouter.post('/admin/login', (req, res) => {
+apiRouter.post('/admin/login', async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Veuillez saisir votre adresse e-mail et votre mot de passe.' });
   }
 
-  const admin = db.prepare('SELECT * FROM admin_users WHERE email = ?').get(email.toLowerCase().trim()) as any;
+  const admin = await db.prepare('SELECT * FROM admin_users WHERE email = ?').get(email.toLowerCase().trim());
 
   if (!admin || !bcrypt.compareSync(password, admin.password_hash)) {
     return res.status(401).json({ error: 'Identifiants administrateur incorrects.' });
   }
 
-  const token = generateToken();
-  const expiresAt = Date.now() + 24 * 3600 * 1000; // 24 hours
-
-  adminSessions.set(token, {
-    adminId: admin.id,
-    email: admin.email,
-    name: admin.name,
-    expiresAt,
-  });
+  const token = signToken({ adminId: admin.id, email: admin.email, name: admin.name });
 
   res.json({
     success: true,
@@ -354,8 +329,7 @@ apiRouter.post('/admin/login', (req, res) => {
 });
 
 apiRouter.post('/admin/logout', requireAdminAuth, (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (token) adminSessions.delete(token);
+  // JWT stateless : rien à invalider côté serveur, le client efface le token.
   res.json({ success: true });
 });
 
@@ -374,35 +348,35 @@ apiRouter.get('/admin/me', requireAdminAuth, (req, res) => {
 // 3. ADMIN DASHBOARD & ATTENDANCE
 // ==========================================
 
-apiRouter.get('/admin/dashboard', requireAdminAuth, (req, res) => {
+apiRouter.get('/admin/dashboard', requireAdminAuth, async (req, res) => {
   // Run passive anomaly scan on open records
-  runAnomalyScan();
+  await runAnomalyScan();
 
   const requestedDate = (req.query.date as string) || getTunisCurrentDateString();
 
   // 1. Total active employees
-  const totalEmployees = (db.prepare('SELECT COUNT(*) as count FROM employees WHERE is_active = 1').get() as any).count;
+  const totalEmployees = ((await db.prepare('SELECT COUNT(*)::int as count FROM employees WHERE is_active = 1').get()) as any).count;
 
   // 2. All active employees
-  const employees = db.prepare(`
+  const employees = (await db.prepare(`
     SELECT id, employee_number, first_name, last_name, department, is_active
     FROM employees 
     WHERE is_active = 1
     ORDER BY employee_number ASC, first_name ASC
-  `).all() as any[];
+  `).all()) as any[];
 
   // 3. Attendance records for selected date
-  const records = db.prepare(`
+  const records = (await db.prepare(`
     SELECT r.*, e.first_name, e.last_name, e.employee_number, e.department
     FROM attendance_records r
     JOIN employees e ON r.employee_id = e.id
     WHERE r.date = ?
-  `).all(requestedDate) as any[];
+  `).all(requestedDate)) as any[];
 
   // 4. Unresolved anomalies count
-  const openAnomaliesCount = (db.prepare(`
-    SELECT COUNT(*) as count FROM anomalies WHERE status IN ('OPEN', 'IN_REVIEW')
-  `).get() as any).count;
+  const openAnomaliesCount = ((await db.prepare(`
+    SELECT COUNT(*)::int as count FROM anomalies WHERE status IN ('OPEN', 'IN_REVIEW')
+  `).get()) as any).count;
 
   // Compute stats and per-employee statuses
   let currentlyWorking = 0;
@@ -411,8 +385,8 @@ apiRouter.get('/admin/dashboard', requireAdminAuth, (req, res) => {
 
   const nowIso = new Date().toISOString();
 
-  const employeeStatusList = employees.map((emp) => {
-    // Find attendance records for this employee on this date
+  const employeeStatusList = [];
+  for (const emp of employees) {
     const empRecords = records.filter((r) => r.employee_id === emp.id);
     const primaryRecord = empRecords[0] || null;
 
@@ -446,10 +420,10 @@ apiRouter.get('/admin/dashboard', requireAdminAuth, (req, res) => {
       totalMinutesWorkedToday += durationMinutes;
 
       // Check if there are anomalies linked to this record
-      const anomCount = (db.prepare(`
-        SELECT COUNT(*) as count FROM anomalies 
+      const anomCount = ((await db.prepare(`
+        SELECT COUNT(*)::int as count FROM anomalies 
         WHERE attendance_record_id = ? AND status IN ('OPEN', 'IN_REVIEW')
-      `).get(primaryRecord.id) as any).count;
+      `).get(primaryRecord.id)) as any).count;
 
       hasAnomaly = anomCount > 0;
 
@@ -463,14 +437,13 @@ apiRouter.get('/admin/dashboard', requireAdminAuth, (req, res) => {
         currentlyWorking++;
       }
     } else {
-      // Check if it's a weekday in the past (absence à vérifier)
       const isPastDate = requestedDate < getTunisCurrentDateString();
       if (isPastDate) {
         status = 'Absence à vérifier';
       }
     }
 
-    return {
+    employeeStatusList.push({
       employeeId: emp.id,
       employeeNumber: emp.employee_number,
       fullName: `${emp.first_name} ${emp.last_name}`,
@@ -484,8 +457,8 @@ apiRouter.get('/admin/dashboard', requireAdminAuth, (req, res) => {
       durationFormatted,
       durationMinutes,
       hasAnomaly,
-    };
-  });
+    });
+  }
 
   const notClockedInToday = totalEmployees - currentlyWorking - completedToday;
 
@@ -505,7 +478,7 @@ apiRouter.get('/admin/dashboard', requireAdminAuth, (req, res) => {
 });
 
 // Full attendance history with filtering & pagination
-apiRouter.get('/admin/attendance', requireAdminAuth, (req, res) => {
+apiRouter.get('/admin/attendance', requireAdminAuth, async (req, res) => {
   const {
     employee_id,
     start_date,
@@ -521,8 +494,8 @@ apiRouter.get('/admin/attendance', requireAdminAuth, (req, res) => {
 
   let query = `
     SELECT r.*, e.first_name, e.last_name, e.employee_number, e.department,
-      (SELECT COUNT(*) FROM anomalies a WHERE a.attendance_record_id = r.id AND a.status IN ('OPEN', 'IN_REVIEW')) as active_anomaly_count,
-      (SELECT GROUP_CONCAT(a.anomaly_type) FROM anomalies a WHERE a.attendance_record_id = r.id) as anomaly_types
+      (SELECT COUNT(*)::int FROM anomalies a WHERE a.attendance_record_id = r.id AND a.status IN ('OPEN', 'IN_REVIEW')) as active_anomaly_count,
+      (SELECT string_agg(a.anomaly_type, ',') FROM anomalies a WHERE a.attendance_record_id = r.id) as anomaly_types
     FROM attendance_records r
     JOIN employees e ON r.employee_id = e.id
     WHERE 1=1
@@ -554,8 +527,8 @@ apiRouter.get('/admin/attendance', requireAdminAuth, (req, res) => {
   }
 
   // Count total matching
-  const countQuery = `SELECT COUNT(*) as count FROM (${query})`;
-  const totalCount = (db.prepare(countQuery).get(...params) as any).count;
+  const countQuery = `SELECT COUNT(*)::int as count FROM (${query}) AS sub`;
+  const totalCount = ((await db.prepare(countQuery).get(...params)) as any).count;
 
   // Sorting
   const allowedSortCols: Record<string, string> = {
@@ -576,7 +549,7 @@ apiRouter.get('/admin/attendance', requireAdminAuth, (req, res) => {
   query += ' LIMIT ? OFFSET ?';
   params.push(pageSize, offset);
 
-  const rows = db.prepare(query).all(...params) as any[];
+  const rows = (await db.prepare(query).all(...params)) as any[];
 
   const formattedRows = rows.map((r) => {
     const dur = calculateDurationMinutes(r.clock_in_at, r.clock_out_at);
@@ -614,32 +587,32 @@ apiRouter.get('/admin/attendance', requireAdminAuth, (req, res) => {
 });
 
 // Single attendance record detail with events and audit logs
-apiRouter.get('/admin/attendance/:id', requireAdminAuth, (req, res) => {
+apiRouter.get('/admin/attendance/:id', requireAdminAuth, async (req, res) => {
   const { id } = req.params;
-  const record = db.prepare(`
+  const record = await db.prepare(`
     SELECT r.*, e.first_name, e.last_name, e.employee_number, e.department
     FROM attendance_records r
     JOIN employees e ON r.employee_id = e.id
     WHERE r.id = ?
-  `).get(id) as any;
+  `).get(id);
 
   if (!record) {
     return res.status(404).json({ error: 'Fiche de pointage introuvable.' });
   }
 
-  const events = db.prepare(`
+  const events = await db.prepare(`
     SELECT * FROM attendance_events 
     WHERE attendance_record_id = ?
     ORDER BY event_at ASC
   `).all(id);
 
-  const anomalies = db.prepare(`
+  const anomalies = await db.prepare(`
     SELECT * FROM anomalies 
     WHERE attendance_record_id = ?
     ORDER BY detected_at DESC
   `).all(id);
 
-  const auditLogs = db.prepare(`
+  const auditLogs = await db.prepare(`
     SELECT * FROM audit_logs 
     WHERE entity_id = ? AND entity_type = 'ATTENDANCE_RECORD'
     ORDER BY created_at DESC
@@ -657,14 +630,14 @@ apiRouter.get('/admin/attendance/:id', requireAdminAuth, (req, res) => {
     anomalies,
     auditLogs: auditLogs.map((log: any) => ({
       ...log,
-      oldValues: log.old_values ? JSON.parse(log.old_values) : null,
-      newValues: log.new_values ? JSON.parse(log.new_values) : null,
+      oldValues: typeof log.old_values === 'string' ? JSON.parse(log.old_values) : log.old_values,
+      newValues: typeof log.new_values === 'string' ? JSON.parse(log.new_values) : log.new_values,
     })),
   });
 });
 
 // MANUAL CORRECTION of start time, end time, and break
-apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
+apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, async (req, res) => {
   const { id } = req.params;
   const { clock_in_at, clock_out_at, reason, break_minutes = 0 } = req.body;
   const admin = (req as any).admin;
@@ -673,7 +646,7 @@ apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
     return res.status(400).json({ error: 'Le motif de correction est obligatoire (minimum 4 caractères).' });
   }
 
-  const existing = db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(id) as any;
+  const existing = await db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(id);
   if (!existing) {
     return res.status(404).json({ error: 'Fiche de pointage introuvable.' });
   }
@@ -706,10 +679,9 @@ apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
     status: clock_out_at ? 'COMPLETED' : 'IN_PROGRESS',
   };
 
-  db.exec('BEGIN TRANSACTION;');
   try {
     // 1. Update record
-    db.prepare(`
+    await db.prepare(`
       UPDATE attendance_records
       SET clock_in_at = ?, clock_out_at = ?, break_minutes = ?, status = ?,
           is_corrected = 1, correction_reason = ?, updated_at = datetime('now')
@@ -718,7 +690,7 @@ apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
 
     // 2. Append immutable audit log
     const auditId = `aud-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO audit_logs (id, administrator_id, action, entity_type, entity_id, old_values, new_values, reason)
       VALUES (?, ?, 'MANUAL_CORRECTION', 'ATTENDANCE_RECORD', ?, ?, ?, ?)
     `).run(
@@ -731,7 +703,7 @@ apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
     );
 
     // 3. Record event
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO attendance_events (id, employee_id, attendance_record_id, event_type, event_at, created_by, metadata)
       VALUES (?, ?, ?, 'MANUAL_CORRECTION', datetime('now'), ?, ?)
     `).run(
@@ -744,7 +716,7 @@ apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
 
     // 4. If missing clock-out anomaly existed and we now supplied a clock-out, auto-resolve it
     if (newValues.clock_out_at) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE anomalies 
         SET status = 'RESOLVED', resolved_at = datetime('now'), resolved_by = ?,
             resolution_notes = 'Résolue automatiquement suite à la correction de l''heure de départ',
@@ -752,10 +724,7 @@ apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
         WHERE attendance_record_id = ? AND anomaly_type = 'MISSING_CLOCK_OUT' AND status IN ('OPEN', 'IN_REVIEW')
       `).run(admin.name, id);
     }
-
-    db.exec('COMMIT;');
   } catch (err: any) {
-    db.exec('ROLLBACK;');
     return res.status(500).json({ error: 'Erreur lors de l\'enregistrement de la correction : ' + err.message });
   }
 
@@ -766,11 +735,11 @@ apiRouter.put('/admin/attendance/:id/correct', requireAdminAuth, (req, res) => {
 // 4. EMPLOYEE MANAGEMENT
 // ==========================================
 
-apiRouter.get('/admin/employees', requireAdminAuth, (req, res) => {
-  const employees = db.prepare(`
+apiRouter.get('/admin/employees', requireAdminAuth, async (req, res) => {
+  const employees = await db.prepare(`
     SELECT e.id, e.employee_number, e.first_name, e.last_name, e.is_active, 
            e.department, e.notes, e.created_at, e.updated_at,
-           (SELECT COUNT(*) FROM attendance_records r WHERE r.employee_id = e.id) as total_shifts,
+           (SELECT COUNT(*)::int FROM attendance_records r WHERE r.employee_id = e.id) as total_shifts,
            (SELECT r.id FROM attendance_records r WHERE r.employee_id = e.id AND r.clock_out_at IS NULL LIMIT 1) as open_shift_id
     FROM employees e
     ORDER BY e.employee_number ASC, e.first_name ASC
@@ -779,7 +748,7 @@ apiRouter.get('/admin/employees', requireAdminAuth, (req, res) => {
   res.json({ data: employees });
 });
 
-apiRouter.post('/admin/employees', requireAdminAuth, (req, res) => {
+apiRouter.post('/admin/employees', requireAdminAuth, async (req, res) => {
   const { employee_number, first_name, last_name, pin, department, notes } = req.body;
   const admin = (req as any).admin;
 
@@ -792,7 +761,7 @@ apiRouter.post('/admin/employees', requireAdminAuth, (req, res) => {
   }
 
   // Check PIN duplicate
-  const allEmployees = db.prepare('SELECT id, pin_hash FROM employees').all() as any[];
+  const allEmployees = (await db.prepare('SELECT id, pin_hash FROM employees').all()) as any[];
   for (const emp of allEmployees) {
     if (bcrypt.compareSync(pin, emp.pin_hash)) {
       return res.status(400).json({ error: 'Ce code PIN est déjà attribué à un autre employé. Veuillez en choisir un autre.' });
@@ -802,13 +771,17 @@ apiRouter.post('/admin/employees', requireAdminAuth, (req, res) => {
   const id = `emp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
   const pinHash = bcrypt.hashSync(pin, 10);
 
-  db.prepare(`
-    INSERT INTO employees (id, employee_number, first_name, last_name, pin_hash, is_active, department, notes)
-    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-  `).run(id, employee_number || null, first_name.trim(), last_name.trim(), pinHash, department || null, notes || null);
+  try {
+    await db.prepare(`
+      INSERT INTO employees (id, employee_number, first_name, last_name, pin_hash, is_active, department, notes)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(id, employee_number || null, first_name.trim(), last_name.trim(), pinHash, department || null, notes || null);
+  } catch (err: any) {
+    return res.status(400).json({ error: 'Impossible de créer l\'employé (matricule déjà utilisé ?).' });
+  }
 
   // Audit log
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO audit_logs (id, administrator_id, action, entity_type, entity_id, new_values, reason)
     VALUES (?, ?, 'CREATE_EMPLOYEE', 'EMPLOYEE', ?, ?, 'Création d\'un nouvel employé')
   `).run(
@@ -821,12 +794,12 @@ apiRouter.post('/admin/employees', requireAdminAuth, (req, res) => {
   res.json({ success: true, message: 'Employé créé avec succès.', id });
 });
 
-apiRouter.put('/admin/employees/:id', requireAdminAuth, (req, res) => {
+apiRouter.put('/admin/employees/:id', requireAdminAuth, async (req, res) => {
   const { id } = req.params;
   const { employee_number, first_name, last_name, is_active, department, notes, pin } = req.body;
   const admin = (req as any).admin;
 
-  const employee = db.prepare('SELECT * FROM employees WHERE id = ?').get(id) as any;
+  const employee = await db.prepare('SELECT * FROM employees WHERE id = ?').get(id);
   if (!employee) {
     return res.status(404).json({ error: 'Employé introuvable.' });
   }
@@ -838,7 +811,7 @@ apiRouter.put('/admin/employees/:id', requireAdminAuth, (req, res) => {
     }
 
     // Check duplicate against others
-    const otherEmployees = db.prepare('SELECT id, pin_hash FROM employees WHERE id != ?').all(id) as any[];
+    const otherEmployees = (await db.prepare('SELECT id, pin_hash FROM employees WHERE id != ?').all(id)) as any[];
     for (const other of otherEmployees) {
       if (bcrypt.compareSync(pin, other.pin_hash)) {
         return res.status(400).json({ error: 'Ce code PIN est déjà utilisé par un autre employé.' });
@@ -847,24 +820,28 @@ apiRouter.put('/admin/employees/:id', requireAdminAuth, (req, res) => {
     newPinHash = bcrypt.hashSync(pin, 10);
   }
 
-  db.prepare(`
-    UPDATE employees 
-    SET employee_number = ?, first_name = ?, last_name = ?, is_active = ?,
-        department = ?, notes = ?, pin_hash = ?, updated_at = datetime('now')
-    WHERE id = ?
-  `).run(
-    employee_number || null,
-    first_name?.trim() || employee.first_name,
-    last_name?.trim() || employee.last_name,
-    is_active !== undefined ? (is_active ? 1 : 0) : employee.is_active,
-    department !== undefined ? department : employee.department,
-    notes !== undefined ? notes : employee.notes,
-    newPinHash,
-    id
-  );
+  try {
+    await db.prepare(`
+      UPDATE employees 
+      SET employee_number = ?, first_name = ?, last_name = ?, is_active = ?,
+          department = ?, notes = ?, pin_hash = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(
+      employee_number || null,
+      first_name?.trim() || employee.first_name,
+      last_name?.trim() || employee.last_name,
+      is_active !== undefined ? (is_active ? 1 : 0) : employee.is_active,
+      department !== undefined ? department : employee.department,
+      notes !== undefined ? notes : employee.notes,
+      newPinHash,
+      id
+    );
+  } catch (err: any) {
+    return res.status(400).json({ error: 'Impossible de mettre à jour l\'employé (matricule déjà utilisé ?).' });
+  }
 
   // Audit log
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO audit_logs (id, administrator_id, action, entity_type, entity_id, old_values, new_values, reason)
     VALUES (?, ?, 'UPDATE_EMPLOYEE', 'EMPLOYEE', ?, ?, ?, 'Mise à jour des informations de l\'employé')
   `).run(
@@ -882,7 +859,7 @@ apiRouter.put('/admin/employees/:id', requireAdminAuth, (req, res) => {
 // 5. ANOMALY MANAGEMENT
 // ==========================================
 
-apiRouter.get('/admin/anomalies', requireAdminAuth, (req, res) => {
+apiRouter.get('/admin/anomalies', requireAdminAuth, async (req, res) => {
   const { status, employee_id, anomaly_type } = req.query;
 
   let query = `
@@ -909,12 +886,12 @@ apiRouter.get('/admin/anomalies', requireAdminAuth, (req, res) => {
   }
 
   query += ' ORDER BY a.detected_at DESC';
-  const anomalies = db.prepare(query).all(...params);
+  const anomalies = await db.prepare(query).all(...params);
 
   res.json({ data: anomalies });
 });
 
-apiRouter.put('/admin/anomalies/:id/resolve', requireAdminAuth, (req, res) => {
+apiRouter.put('/admin/anomalies/:id/resolve', requireAdminAuth, async (req, res) => {
   const { id } = req.params;
   const { status, resolution_notes } = req.body; // 'RESOLVED', 'DISMISSED', 'IN_REVIEW', 'OPEN'
   const admin = (req as any).admin;
@@ -923,21 +900,21 @@ apiRouter.put('/admin/anomalies/:id/resolve', requireAdminAuth, (req, res) => {
     return res.status(400).json({ error: 'Statut d\'anomalie invalide.' });
   }
 
-  const existing = db.prepare('SELECT * FROM anomalies WHERE id = ?').get(id) as any;
+  const existing = await db.prepare('SELECT * FROM anomalies WHERE id = ?').get(id);
   if (!existing) {
     return res.status(404).json({ error: 'Anomalie introuvable.' });
   }
 
   const resolvedAt = ['RESOLVED', 'DISMISSED'].includes(status) ? new Date().toISOString() : null;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE anomalies 
     SET status = ?, resolution_notes = ?, resolved_by = ?, resolved_at = ?, updated_at = datetime('now')
     WHERE id = ?
   `).run(status, resolution_notes || null, admin.name, resolvedAt, id);
 
   // Audit log
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO audit_logs (id, administrator_id, action, entity_type, entity_id, old_values, new_values, reason)
     VALUES (?, ?, 'RESOLVE_ANOMALY', 'ANOMALY', ?, ?, ?, ?)
   `).run(
@@ -952,8 +929,8 @@ apiRouter.put('/admin/anomalies/:id/resolve', requireAdminAuth, (req, res) => {
   res.json({ success: true, message: `Anomalie marquée comme ${status}.` });
 });
 
-apiRouter.post('/admin/anomalies/run-check', requireAdminAuth, (req, res) => {
-  const result = runAnomalyScan();
+apiRouter.post('/admin/anomalies/run-check', requireAdminAuth, async (req, res) => {
+  const result = await runAnomalyScan();
   res.json({ success: true, message: `Analyse terminée. ${result.detectedCount} nouvelle(s) anomalie(s) détectée(s).` });
 });
 
@@ -961,7 +938,7 @@ apiRouter.post('/admin/anomalies/run-check', requireAdminAuth, (req, res) => {
 // 6. REPORTS & CSV EXPORT
 // ==========================================
 
-apiRouter.get('/admin/reports/summary', requireAdminAuth, (req, res) => {
+apiRouter.get('/admin/reports/summary', requireAdminAuth, async (req, res) => {
   const { start_date, end_date, employee_id } = req.query;
 
   let filter = 'WHERE 1=1';
@@ -980,12 +957,12 @@ apiRouter.get('/admin/reports/summary', requireAdminAuth, (req, res) => {
     params.push(employee_id);
   }
 
-  const records = db.prepare(`
+  const records = (await db.prepare(`
     SELECT r.*, e.first_name, e.last_name, e.employee_number
     FROM attendance_records r
     JOIN employees e ON r.employee_id = e.id
     ${filter}
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
   let totalShifts = records.length;
   let completedShifts = 0;
@@ -1003,11 +980,12 @@ apiRouter.get('/admin/reports/summary', requireAdminAuth, (req, res) => {
   }
 
   // Anomalies in range
-  const anomaliesCount = (db.prepare(`
-    SELECT COUNT(*) as count FROM anomalies a
+  const anomalyRow = await db.prepare(`
+    SELECT COUNT(*)::int as count FROM anomalies a
     JOIN attendance_records r ON a.attendance_record_id = r.id
     ${filter}
-  `).get(...params) as any)?.count || 0;
+  `).get(...params);
+  const anomaliesCount = anomalyRow?.count || 0;
 
   res.json({
     totalShifts,
@@ -1019,7 +997,7 @@ apiRouter.get('/admin/reports/summary', requireAdminAuth, (req, res) => {
   });
 });
 
-apiRouter.get('/admin/reports/export-csv', requireAdminAuth, (req, res) => {
+apiRouter.get('/admin/reports/export-csv', requireAdminAuth, async (req, res) => {
   const { start_date, end_date, employee_id } = req.query;
 
   let filter = 'WHERE 1=1';
@@ -1038,14 +1016,14 @@ apiRouter.get('/admin/reports/export-csv', requireAdminAuth, (req, res) => {
     params.push(employee_id);
   }
 
-  const records = db.prepare(`
+  const records = (await db.prepare(`
     SELECT r.*, e.first_name, e.last_name, e.employee_number, e.department,
-           (SELECT COUNT(*) FROM anomalies a WHERE a.attendance_record_id = r.id) as anomaly_count
+           (SELECT COUNT(*)::int FROM anomalies a WHERE a.attendance_record_id = r.id) as anomaly_count
     FROM attendance_records r
     JOIN employees e ON r.employee_id = e.id
     ${filter}
     ORDER BY r.date DESC, r.clock_in_at DESC
-  `).all(...params) as any[];
+  `).all(...params)) as any[];
 
   // Build CSV with UTF-8 BOM for French Excel compatibility
   const BOM = '\uFEFF';
@@ -1116,12 +1094,12 @@ apiRouter.get('/admin/reports/export-csv', requireAdminAuth, (req, res) => {
 // 7. COMPANY SETTINGS
 // ==========================================
 
-apiRouter.get('/admin/settings', requireAdminAuth, (req, res) => {
-  const settings = getCompanySettings();
+apiRouter.get('/admin/settings', requireAdminAuth, async (req, res) => {
+  const settings = await getCompanySettings();
   res.json({ data: settings });
 });
 
-apiRouter.put('/admin/settings', requireAdminAuth, (req, res) => {
+apiRouter.put('/admin/settings', requireAdminAuth, async (req, res) => {
   const {
     company_name,
     expected_start_time,
@@ -1135,7 +1113,7 @@ apiRouter.put('/admin/settings', requireAdminAuth, (req, res) => {
   } = req.body;
   const admin = (req as any).admin;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE company_settings
     SET company_name = ?, expected_start_time = ?, expected_end_time = ?,
         late_grace_minutes = ?, long_shift_hours = ?, missing_clock_out_hours = ?,
@@ -1155,7 +1133,7 @@ apiRouter.put('/admin/settings', requireAdminAuth, (req, res) => {
   );
 
   // Audit log
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO audit_logs (id, administrator_id, action, entity_type, entity_id, new_values, reason)
     VALUES (?, ?, 'UPDATE_SETTINGS', 'COMPANY_SETTINGS', '1', ?, 'Mise à jour des paramètres entreprise')
   `).run(
@@ -1171,8 +1149,8 @@ apiRouter.put('/admin/settings', requireAdminAuth, (req, res) => {
 // 8. AUDIT LOGS
 // ==========================================
 
-apiRouter.get('/admin/audit-logs', requireAdminAuth, (req, res) => {
-  const logs = db.prepare(`
+apiRouter.get('/admin/audit-logs', requireAdminAuth, async (req, res) => {
+  const logs = await db.prepare(`
     SELECT * FROM audit_logs 
     ORDER BY created_at DESC 
     LIMIT 100
@@ -1181,8 +1159,8 @@ apiRouter.get('/admin/audit-logs', requireAdminAuth, (req, res) => {
   res.json({
     data: logs.map((log: any) => ({
       ...log,
-      oldValues: log.old_values ? JSON.parse(log.old_values) : null,
-      newValues: log.new_values ? JSON.parse(log.new_values) : null,
+      oldValues: typeof log.old_values === 'string' ? JSON.parse(log.old_values) : log.old_values,
+      newValues: typeof log.new_values === 'string' ? JSON.parse(log.new_values) : log.new_values,
     })),
   });
 });

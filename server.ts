@@ -14,9 +14,6 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 // Middleware
 app.use(express.json());
 
-// Initialize database
-initDatabase();
-
 // Mount API routes
 app.use('/api', apiRouter);
 
@@ -27,6 +24,9 @@ app.get('/api/health', (req, res) => {
 
 // Setup Vite middleware in dev or static files in production
 async function startServer() {
+  // Provisionne le schéma Supabase et les données de démonstration
+  await initDatabase();
+
   if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.resolve(__dirname, 'dist')));
     app.get('*', (req, res) => {

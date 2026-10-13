@@ -1,9 +1,8 @@
 node_modules/
 build/
 dist/
-server.js
-data/
 coverage/
+data/
 .DS_Store
 *.log
 .env*

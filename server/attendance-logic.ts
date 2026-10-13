@@ -143,8 +143,8 @@ export interface CompanySettingsRow {
   early_departure_enabled: number;
 }
 
-export function getCompanySettings(): CompanySettingsRow {
-  const row = db.prepare('SELECT * FROM company_settings WHERE id = 1').get() as unknown as CompanySettingsRow;
+export async function getCompanySettings(): Promise<CompanySettingsRow> {
+  const row = (await db.prepare('SELECT * FROM company_settings WHERE id = 1').get()) as CompanySettingsRow;
   return row;
 }
 
@@ -194,18 +194,18 @@ export function checkEarlyDeparture(clockOutIso: string, settings: CompanySettin
 }
 
 // Background / on-demand anomaly scan
-export function runAnomalyScan(): { detectedCount: number } {
-  const settings = getCompanySettings();
+export async function runAnomalyScan(): Promise<{ detectedCount: number }> {
+  const settings = await getCompanySettings();
   const now = new Date();
   let detectedCount = 0;
 
   // 1. Check for missing clock-outs (shifts opened > missing_clock_out_hours)
-  const openRecords = db.prepare(`
+  const openRecords = (await db.prepare(`
     SELECT r.*, e.first_name, e.last_name 
     FROM attendance_records r
     JOIN employees e ON r.employee_id = e.id
     WHERE r.clock_out_at IS NULL AND r.clock_in_at IS NOT NULL
-  `).all() as any[];
+  `).all()) as any[];
 
   for (const rec of openRecords) {
     const startMs = new Date(rec.clock_in_at).getTime();
@@ -213,14 +213,14 @@ export function runAnomalyScan(): { detectedCount: number } {
 
     if (elapsedHours > settings.missing_clock_out_hours) {
       // Check if an anomaly already exists for this record
-      const existing = db.prepare(`
+      const existing = await db.prepare(`
         SELECT id FROM anomalies 
         WHERE attendance_record_id = ? AND anomaly_type = 'MISSING_CLOCK_OUT'
       `).get(rec.id);
 
       if (!existing) {
         const anomId = `anom-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        db.prepare(`
+        await db.prepare(`
           INSERT INTO anomalies (id, employee_id, attendance_record_id, anomaly_type, severity, description, status, detected_at)
           VALUES (?, ?, ?, 'MISSING_CLOCK_OUT', 'HIGH', ?, 'OPEN', datetime('now'))
         `).run(
@@ -230,7 +230,7 @@ export function runAnomalyScan(): { detectedCount: number } {
           `Départ non enregistré pour ${rec.first_name} ${rec.last_name} (${elapsedHours.toFixed(1)} h écoulées depuis l'arrivée)`
         );
 
-        db.prepare(`
+        await db.prepare(`
           UPDATE attendance_records SET status = 'ANOMALY', updated_at = datetime('now') WHERE id = ?
         `).run(rec.id);
 
@@ -240,12 +240,12 @@ export function runAnomalyScan(): { detectedCount: number } {
   }
 
   // 2. Check for long shifts (> long_shift_hours) on completed records
-  const completedRecords = db.prepare(`
+  const completedRecords = (await db.prepare(`
     SELECT r.*, e.first_name, e.last_name 
     FROM attendance_records r
     JOIN employees e ON r.employee_id = e.id
     WHERE r.clock_out_at IS NOT NULL AND r.clock_in_at IS NOT NULL
-  `).all() as any[];
+  `).all()) as any[];
 
   for (const rec of completedRecords) {
     const startMs = new Date(rec.clock_in_at).getTime();
@@ -253,14 +253,14 @@ export function runAnomalyScan(): { detectedCount: number } {
     const shiftHours = (endMs - startMs) / (3600 * 1000);
 
     if (shiftHours > settings.long_shift_hours) {
-      const existing = db.prepare(`
+      const existing = await db.prepare(`
         SELECT id FROM anomalies 
         WHERE attendance_record_id = ? AND anomaly_type = 'LONG_SHIFT'
       `).get(rec.id);
 
       if (!existing) {
         const anomId = `anom-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        db.prepare(`
+        await db.prepare(`
           INSERT INTO anomalies (id, employee_id, attendance_record_id, anomaly_type, severity, description, status, detected_at)
           VALUES (?, ?, ?, 'LONG_SHIFT', 'MEDIUM', ?, 'OPEN', datetime('now'))
         `).run(
