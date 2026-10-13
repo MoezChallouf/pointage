@@ -1,0 +1,6 @@
+{
+  "name": "PointageRH Tunisie",
+  "description": "Application de pointage et gestion de présence RH pour entreprise en Tunisie",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
